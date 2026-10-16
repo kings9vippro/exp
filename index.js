@@ -1,9 +1,9 @@
 // =====================================================================
-// ZALO QR LOGIN - SỬA LỖI TIMEOUT: TĂNG THỜI GIAN CHỜ, BỎ QUA LỖI TẠM THỜI
-// - Tăng timeout của fetch lên 30 giây.
-// - Trong vòng lặp waiting-scan, bắt mọi lỗi timeout và tiếp tục poll.
-// - Thử lại 3 lần nếu tạo mã QR thất bại.
-// - Chỉ chuyển sang trạng thái ERROR khi thực sự không thể phục hồi.
+// ZALO QR LOGIN - SỬA LỖI "MÃ QR ĐĂNG NHẬP KHÔNG HỢP LỆ"
+// Nguyên nhân: Zalo yêu cầu tham số imei trong các request tạo mã QR.
+// Nếu thiếu imei, mã QR sinh ra sẽ không hợp lệ khi quét.
+// Giải pháp: Thêm imei vào body của cả 2 request: generate và waiting-scan.
+// Đồng thời ưu tiên sử dụng trường "code" từ API thay vì "image" hoặc "url".
 // =====================================================================
 
 const express = require('express');
@@ -52,7 +52,6 @@ function stringifyJar(jar) {
     return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// Hàm fetch an toàn, có thể tùy chỉnh timeout
 async function safeFetchWithCookies(url, options = {}, jar = {}, timeoutMs = FETCH_TIMEOUT_MS) {
     let targetUrl = url;
     let redirectCount = 0;
@@ -91,10 +90,10 @@ async function safeFetchWithCookies(url, options = {}, jar = {}, timeoutMs = FET
     throw new Error("Quá nhiều lần chuyển hướng");
 }
 
-// Tạo mã QR với retry
-async function generateQRWithRetry(cookieJar, maxRetries = 3) {
+async function generateQRWithRetry(cookieJar, imei, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+            // BẮT BUỘC: gửi kèm imei trong body
             const qrRes = await safeFetchWithCookies("https://id.zalo.me/account/authen/qr/generate", {
                 method: "POST",
                 headers: {
@@ -105,7 +104,10 @@ async function generateQRWithRetry(cookieJar, maxRetries = 3) {
                     "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
                     "X-Requested-With": "XMLHttpRequest"
                 },
-                body: new URLSearchParams({ continue: "https://chat.zalo.me/" }).toString()
+                body: new URLSearchParams({
+                    continue: "https://chat.zalo.me/",
+                    imei: imei // Tham số quan trọng
+                }).toString()
             }, cookieJar, FETCH_TIMEOUT_MS);
 
             const qrJson = await qrRes.json();
@@ -119,7 +121,7 @@ async function generateQRWithRetry(cookieJar, maxRetries = 3) {
         } catch (err) {
             console.error(`[QR Generate] Lần ${attempt} thất bại:`, err.message);
             if (attempt === maxRetries) throw err;
-            await new Promise(r => setTimeout(r, 2000)); // Chờ 2s trước khi thử lại
+            await new Promise(r => setTimeout(r, 2000));
         }
     }
 }
@@ -128,12 +130,13 @@ async function runSingleSession() {
     currentSession.id = crypto.randomUUID().slice(0, 8);
     currentSession.status = 'INITIALIZING';
     currentSession.qrData = null;
-    currentSession.imei = crypto.randomUUID();
+    currentSession.imei = crypto.randomUUID(); // Tạo imei duy nhất cho phiên
     currentSession.cookies = null;
     currentSession.error = null;
 
     console.log(`\n========================================`);
     console.log(`[Phiên: ${currentSession.id}] Bắt đầu tạo mã QR...`);
+    console.log(`[Phiên: ${currentSession.id}] IMEI: ${currentSession.imei}`);
 
     try {
         let cookieJar = {
@@ -141,7 +144,7 @@ async function runSingleSession() {
             "has_actived": "1"
         };
 
-        // 1. Khởi tạo phiên Zalo (có thể bỏ qua nếu lỗi, không ảnh hưởng lớn)
+        // 1. Khởi tạo phiên Zalo (có thể bỏ qua nếu lỗi)
         try {
             await safeFetchWithCookies("https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F", {
                 method: "GET",
@@ -154,12 +157,15 @@ async function runSingleSession() {
             console.warn(`[Phiên: ${currentSession.id}] Khởi tạo phiên thất bại (bỏ qua):`, e.message);
         }
 
-        // 2. Tạo mã QR với retry
-        const qrData = await generateQRWithRetry(cookieJar);
-        const code = qrData.code;
-        currentSession.qrData = qrData.image || qrData.url || code;
+        // 2. Tạo mã QR với retry (truyền imei vào)
+        const qrData = await generateQRWithRetry(cookieJar, currentSession.imei);
+
+        // ƯU TIÊN trường code (chuỗi thực sự dùng để tạo QR), sau đó mới đến image/url
+        const qrContent = qrData.code || qrData.qr_code || qrData.url || qrData.image;
+        currentSession.qrData = qrContent;
         currentSession.status = 'WAITING';
         console.log(`[Phiên: ${currentSession.id}] ✅ Đã tạo mã QR thành công! Chờ quét...`);
+        console.log(`[Phiên: ${currentSession.id}] Nội dung QR: ${qrContent}`);
 
         // 3. Vòng lặp chờ quét, bỏ qua mọi lỗi timeout
         const startTime = Date.now();
@@ -169,6 +175,7 @@ async function runSingleSession() {
             await new Promise(r => setTimeout(r, 2000));
 
             try {
+                // BẮT BUỘC: gửi kèm imei trong body
                 const checkRes = await safeFetchWithCookies("https://id.zalo.me/account/authen/qr/waiting-scan", {
                     method: "POST",
                     headers: {
@@ -180,10 +187,11 @@ async function runSingleSession() {
                         "X-Requested-With": "XMLHttpRequest"
                     },
                     body: new URLSearchParams({
-                        code: code,
-                        continue: "https://chat.zalo.me/"
+                        code: qrData.code, // Dùng code từ bước generate
+                        continue: "https://chat.zalo.me/",
+                        imei: currentSession.imei // Tham số quan trọng
                     }).toString()
-                }, cookieJar, 10000); // Timeout ngắn hơn cho waiting-scan (10s)
+                }, cookieJar, 10000);
 
                 const checkJson = await checkRes.json();
                 console.log(`[Waiting Scan]`, JSON.stringify(checkJson, null, 2));
@@ -202,7 +210,6 @@ async function runSingleSession() {
                     break;
                 }
             } catch (err) {
-                // Bỏ qua lỗi timeout hoặc lỗi mạng tạm thời, tiếp tục poll
                 console.warn(`[Waiting Scan] Lỗi tạm thời (bỏ qua):`, err.message);
             }
         }
@@ -325,6 +332,7 @@ app.get('/', (req, res) => {
                             const qrContainer = document.getElementById('qrcode');
                             qrContainer.innerHTML = '';
 
+                            // Xử lý hiển thị QR: nếu là ảnh base64 thì hiển thị, ngược lại tạo QR từ chuỗi
                             if (data.qrData.startsWith('data:image')) {
                                 qrContainer.innerHTML = '<img src="' + data.qrData + '" style="width:230px;height:230px;" />';
                             } else {
