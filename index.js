@@ -5,35 +5,43 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // Giả lập Safari / macOS để Zalo nhận diện thiết bị Apple
-const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
 
 let currentSession = {
     id: null,
     status: 'INITIALIZING', // INITIALIZING | WAITING | SUCCESS | ERROR
-    qrData: null,          // Dữ liệu mã QR (Base64 hoặc URL)
+    qrData: null,
     imei: null,
     cookies: null,
     error: null
 };
 
-// Đọc cookie từ phản hồi server
-function parseCookies(responseHeaders) {
-    const raw = responseHeaders.getSetCookie ? responseHeaders.getSetCookie() : [];
-    let jar = {};
-    raw.forEach(header => {
-        const parts = header.split(';')[0].split('=');
-        if (parts.length >= 2) {
-            jar[parts[0].trim()] = parts.slice(1).join('=').trim();
+// Hàm trích xuất toàn bộ cookie từ phản hồi của Zalo
+function collectCookies(response, cookieJar) {
+    let setCookies = [];
+    if (typeof response.headers.getSetCookie === 'function') {
+        setCookies = response.headers.getSetCookie();
+    } else {
+        const raw = response.headers.get('set-cookie');
+        if (raw) setCookies = [raw];
+    }
+
+    for (const cookieStr of setCookies) {
+        const firstPart = cookieStr.split(';')[0];
+        const eqIdx = firstPart.indexOf('=');
+        if (eqIdx !== -1) {
+            const key = firstPart.substring(0, eqIdx).trim();
+            const val = firstPart.substring(eqIdx + 1).trim();
+            if (key) cookieJar[key] = val;
         }
-    });
-    return jar;
+    }
 }
 
 function stringifyCookies(cookieJar) {
     return Object.entries(cookieJar).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// Vòng lặp xoay vòng mã QR liên tục (Dùng 1 lần rồi hủy)
+// Vòng lặp tự động tạo QR một lần và làm mới liên tục
 async function startSessionLoop() {
     while (true) {
         currentSession.id = crypto.randomUUID().slice(0, 8);
@@ -49,54 +57,81 @@ async function startSessionLoop() {
         try {
             let cookieJar = {};
 
-            // 1. Lấy phiên truy cập từ Zalo ID
+            // 1. Tải trang xác thực ban đầu để lấy cookie phiên (Session Cookies)
             const initRes = await fetch("https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F", {
-                headers: { "User-Agent": USER_AGENT }
-            });
-            Object.assign(cookieJar, parseCookies(initRes.headers));
-
-            // 2. Yêu cầu tạo mã QR
-            const qrRes = await fetch("https://id.zalo.me/account/authen/qr/generate", {
                 headers: {
                     "User-Agent": USER_AGENT,
-                    "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
-                    "Cookie": stringifyCookies(cookieJar)
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8"
                 }
             });
-            Object.assign(cookieJar, parseCookies(qrRes.headers));
+            collectCookies(initRes, cookieJar);
+
+            // 2. Gửi request POST đúng chuẩn để sinh mã QR
+            const qrRes = await fetch("https://id.zalo.me/account/authen/qr/generate", {
+                method: "POST",
+                headers: {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": "https://id.zalo.me",
+                    "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Cookie": stringifyCookies(cookieJar)
+                },
+                body: new URLSearchParams({
+                    continue: "https://chat.zalo.me/"
+                }).toString()
+            });
+
+            collectCookies(qrRes, cookieJar);
 
             const qrJson = await qrRes.json();
             if (qrJson.error_code !== 0 || !qrJson.data) {
-                throw new Error(qrJson.error_message || "Zalo từ chối sinh mã QR");
+                throw new Error(qrJson.error_message || "Zalo từ chối cấp mã QR");
             }
 
             const code = qrJson.data.code;
-            // Sử dụng ảnh base64 trực tiếp từ Zalo hoặc chuỗi mã code
             currentSession.qrData = qrJson.data.image || qrJson.data.url || code;
             currentSession.status = 'WAITING';
-            console.log(`[Phiên: ${currentSession.id}] QR sẵn sàng, đang đợi quét...`);
+            console.log(`[Phiên: ${currentSession.id}] ✅ Đã tạo mã QR thành công! Chờ quét...`);
 
-            // 3. Chờ xác nhận từ điện thoại
+            // 3. Vòng lặp chờ xác nhận quét từ điện thoại
             const startTime = Date.now();
             let isDone = false;
 
-            while (Date.now() - startTime < 120000) { // Hạn mã 2 phút
+            while (Date.now() - startTime < 120000) { // Hạn mã: 2 phút
                 await new Promise(r => setTimeout(r, 2000));
 
-                const checkRes = await fetch(`https://id.zalo.me/account/authen/qr/waiting-scan?code=${encodeURIComponent(code)}`, {
+                const checkRes = await fetch("https://id.zalo.me/account/authen/qr/waiting-scan", {
+                    method: "POST",
                     headers: {
                         "User-Agent": USER_AGENT,
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Origin": "https://id.zalo.me",
                         "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
+                        "X-Requested-With": "XMLHttpRequest",
                         "Cookie": stringifyCookies(cookieJar)
-                    }
+                    },
+                    body: new URLSearchParams({
+                        code: code,
+                        continue: "https://chat.zalo.me/"
+                    }).toString()
                 });
-                Object.assign(cookieJar, parseCookies(checkRes.headers));
+
+                collectCookies(checkRes, cookieJar);
 
                 const checkJson = await checkRes.json();
 
-                // Đã bấm Chấp nhận trên điện thoại
+                // Trạng thái đã duyệt trên ứng dụng Zalo
                 if (checkJson.error_code === 0 && checkJson.data && (checkJson.data.status === 2 || checkJson.data.url)) {
-                    console.log(`🎉 [Phiên: ${currentSession.id}] Đăng nhập thành công!`);
+                    console.log(`🎉 [Phiên: ${currentSession.id}] Đăng nhập thành công từ thiết bị Apple!`);
 
                     if (checkJson.data.url) {
                         const finalRes = await fetch(checkJson.data.url, {
@@ -106,22 +141,22 @@ async function startSessionLoop() {
                             },
                             redirect: 'manual'
                         });
-                        Object.assign(cookieJar, parseCookies(finalRes.headers));
+                        collectCookies(finalRes, cookieJar);
                     }
 
                     currentSession.status = 'SUCCESS';
                     currentSession.cookies = cookieJar;
-                    currentSession.qrData = null; // Tiêu hủy QR ngay khi hoàn tất
+                    currentSession.qrData = null; // Tiêu hủy QR ngay lập tức
                     isDone = true;
 
-                    // Giữ 3.5 giây hiển thị thông báo rồi chuyển sang máy tiếp theo
+                    // Dừng 3.5 giây để màn hình báo thành công trước khi đổi sang QR mới
                     await new Promise(r => setTimeout(r, 3500));
                     break;
                 }
             }
 
             if (!isDone) {
-                console.log(`[Phiên: ${currentSession.id}] Hết hạn chờ, đang sinh mã mới.`);
+                console.log(`[Phiên: ${currentSession.id}] Mã QR hết hạn, đang tạo mã mới...`);
             }
 
         } catch (err) {
@@ -135,12 +170,12 @@ async function startSessionLoop() {
 
 startSessionLoop();
 
-// API trạng thái
+// API cung cấp dữ liệu phiên cho giao diện
 app.get('/api/status', (req, res) => {
     res.json(currentSession);
 });
 
-// Giao diện tự động render QR qua CDN (Không phụ thuộc module server)
+// Giao diện người dùng
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -148,10 +183,10 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Zalo QR Login</title>
+        <title>Zalo QR Login (Apple)</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
         <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
+            * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
             body {
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 background-color: #f0f2f5; display: flex; justify-content: center; align-items: center;
@@ -190,7 +225,7 @@ app.get('/', (req, res) => {
             }
             .result-box textarea {
                 width: 100%; height: 80px; margin-top: 6px; font-family: monospace;
-                font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 4px;
+                font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; resize: none;
             }
         </style>
     </head>
@@ -205,17 +240,16 @@ app.get('/', (req, res) => {
                 <div id="qrcode"></div>
             </div>
 
-            <div class="status-text" id="statusText">Đang khởi tạo mã...</div>
+            <div class="status-text" id="statusText">Đang khởi tạo mã QR...</div>
 
             <div class="result-box" id="resultBox">
-                <b>Trạng thái:</b> Đã bắt phiên đăng nhập!<br>
+                <b>Trạng thái:</b> Đã xác nhận đăng nhập thành công!<br>
                 <textarea id="resCookies" readonly></textarea>
             </div>
         </div>
 
         <script>
             let lastSid = null;
-            let qrCodeObj = null;
 
             setInterval(async () => {
                 try {
@@ -225,7 +259,7 @@ app.get('/', (req, res) => {
                     if (data.status === 'INITIALIZING') {
                         document.getElementById('spinner').style.display = 'block';
                         document.getElementById('qrcode').innerHTML = '';
-                        document.getElementById('statusText').innerText = 'Đang tạo mã QR mới...';
+                        document.getElementById('statusText').innerText = 'Đang yêu cầu mã từ Zalo...';
                         document.getElementById('statusText').style.color = '#555';
                         document.getElementById('resultBox').style.display = 'none';
                     } 
@@ -251,14 +285,15 @@ app.get('/', (req, res) => {
                     } 
                     else if (data.status === 'SUCCESS') {
                         document.getElementById('spinner').style.display = 'none';
-                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;">✔ Đã nhận diện!<br>Mã cũ đã bị hủy.</p>';
-                        document.getElementById('statusText').innerText = '🎉 Thành công! Đang chuyển tiếp mã mới...';
+                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;">✔ Đã nhận diện!<br>Mã này đã bị hủy.</p>';
+                        document.getElementById('statusText').innerText = '🎉 Đăng nhập thành công! Đang đổi mã mới...';
                         document.getElementById('statusText').style.color = '#28a745';
                         document.getElementById('resultBox').style.display = 'block';
                         document.getElementById('resCookies').value = JSON.stringify(data.cookies);
                     }
                     else if (data.status === 'ERROR') {
-                        document.getElementById('statusText').innerText = 'Lỗi kết nối Zalo, đang thử lại...';
+                        document.getElementById('spinner').style.display = 'none';
+                        document.getElementById('statusText').innerText = data.error || 'Lỗi kết nối Zalo, đang thử lại...';
                         document.getElementById('statusText').style.color = '#dc3545';
                     }
                 } catch (e) {}
