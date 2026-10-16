@@ -1,6 +1,5 @@
 const express = require('express');
 const crypto = require('crypto');
-const QRCode = require('qrcode');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -115,23 +114,16 @@ async function startSessionLoop() {
                 throw new Error(qrJson.error_message || "Zalo từ chối sinh mã QR");
             }
 
-            const code = qrJson.data.code;
-            
-            // Vẽ QR trực tiếp từ mã code trả về
-            if (qrJson.data.image && qrJson.data.image.startsWith('data:image')) {
-                currentSession.qrData = qrJson.data.image;
-            } else {
-                currentSession.qrData = await QRCode.toDataURL(code);
-            }
-
+            // Lấy ảnh base64 hoặc chuỗi code của Zalo
+            currentSession.qrData = qrJson.data.image || qrJson.data.url || qrJson.data.code;
             currentSession.status = 'WAITING';
             console.log(`[Phiên: ${currentSession.id}] ✅ Đã tạo QR thành công! Chờ quét...`);
 
-            // 3. Vòng lặp chờ xác nhận từ điện thoại
+            // 3. Chờ quét từ điện thoại
             const startTime = Date.now();
             let isDone = false;
 
-            while (Date.now() - startTime < 120000) { // Hạn 2 phút
+            while (Date.now() - startTime < 120000) {
                 await new Promise(r => setTimeout(r, 2000));
 
                 const checkRes = await safeFetch("https://id.zalo.me/account/authen/qr/waiting-scan", {
@@ -145,7 +137,7 @@ async function startSessionLoop() {
                         "X-Zalo-Web-Version": "2.0.0"
                     },
                     body: new URLSearchParams({
-                        code: code,
+                        code: qrJson.data.code,
                         continue: "https://chat.zalo.me/",
                         imei: currentSession.imei
                     }).toString()
@@ -167,7 +159,6 @@ async function startSessionLoop() {
                         currentSession.qrData = null;
                         isDone = true;
                         
-                        // Chờ 4 giây hiện thông báo rồi đổi sang mã mới
                         await new Promise(r => setTimeout(r, 4000));
                         break;
                     }
@@ -201,6 +192,8 @@ app.get('/', (req, res) => {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Đăng nhập Zalo - Máy tính</title>
+        <!-- Thư viện tạo QR chạy trên trình duyệt người dùng qua CDN -->
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body { font-family: -apple-system, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 16px; }
@@ -224,7 +217,7 @@ app.get('/', (req, res) => {
             <p class="desc">Mở Zalo trên điện thoại để quét mã</p>
             <div class="qr-wrapper" id="qrContainer">
                 <div class="spinner" id="spinner"></div>
-                <img id="qrImg" style="display: none;" alt="QR Code">
+                <div id="qrcode"></div>
             </div>
             <div class="status-text" id="statusText">Đang khởi tạo mã QR...</div>
             <div class="result-box" id="resultBox">
@@ -240,22 +233,30 @@ app.get('/', (req, res) => {
                     const data = await res.json();
                     if (data.status === 'INITIALIZING') {
                         document.getElementById('spinner').style.display = 'block';
-                        document.getElementById('qrImg').style.display = 'none';
+                        document.getElementById('qrcode').innerHTML = '';
                         document.getElementById('statusText').innerText = 'Đang yêu cầu mã QR từ Zalo...';
                         document.getElementById('resultBox').style.display = 'none';
                     } else if (data.status === 'WAITING' && data.qrData) {
                         if (lastSid !== data.id) {
                             lastSid = data.id;
                             document.getElementById('spinner').style.display = 'none';
-                            const img = document.getElementById('qrImg');
-                            img.src = data.qrData;
-                            img.style.display = 'block';
+                            const qrBox = document.getElementById('qrcode');
+                            qrBox.innerHTML = '';
+                            if (data.qrData.startsWith('data:image')) {
+                                qrBox.innerHTML = '<img src="' + data.qrData + '" style="width:230px;height:230px;" />';
+                            } else {
+                                new QRCode(qrBox, {
+                                    text: data.qrData,
+                                    width: 230,
+                                    height: 230
+                                });
+                            }
                             document.getElementById('statusText').innerText = 'Quét mã → Bấm Đồng ý trên điện thoại';
                             document.getElementById('statusText').style.color = '#0068ff';
                         }
                     } else if (data.status === 'SUCCESS') {
                         document.getElementById('spinner').style.display = 'none';
-                        document.getElementById('qrImg').style.display = 'none';
+                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;">✔ Đã nhận diện!<br>Mã QR đã hủy.</p>';
                         document.getElementById('statusText').innerText = '🎉 Đăng nhập máy tính thành công!';
                         document.getElementById('statusText').style.color = '#28a745';
                         document.getElementById('resultBox').style.display = 'block';
