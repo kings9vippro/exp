@@ -1,9 +1,10 @@
 // =====================================================================
-// ZALO QR LOGIN - SỬA LỖI "MÃ QR ĐĂNG NHẬP KHÔNG HỢP LỆ"
-// Nguyên nhân: Zalo yêu cầu tham số imei trong các request tạo mã QR.
-// Nếu thiếu imei, mã QR sinh ra sẽ không hợp lệ khi quét.
-// Giải pháp: Thêm imei vào body của cả 2 request: generate và waiting-scan.
-// Đồng thời ưu tiên sử dụng trường "code" từ API thay vì "image" hoặc "url".
+// ZALO QR LOGIN - MACBOOK REQUEST SIMULATION
+// - Tạo IMEI 15 chữ số ngẫu nhiên (chuẩn Zalo Web).
+// - Gửi kèm IMEI trong cả request generate và waiting-scan.
+// - Thêm header X-Zalo-Web-Version để tương thích API.
+// - Giao diện hiển thị yêu cầu đăng nhập từ MacBook Pro.
+// - Sau khi xác nhận thành công, hiển thị Cookies (thu gọn) và IMEI.
 // =====================================================================
 
 const express = require('express');
@@ -17,17 +18,19 @@ const QR_TIMEOUT_MS = 5 * 60 * 1000;
 // Timeout cho mỗi request fetch (30 giây)
 const FETCH_TIMEOUT_MS = 30000;
 
+// Giả lập User-Agent của MacBook Safari
 const APPLE_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
 
 let currentSession = {
     id: null,
-    status: 'INITIALIZING',
+    status: 'INITIALIZING', // INITIALIZING | WAITING | SUCCESS | ERROR
     qrData: null,
     imei: null,
     cookies: null,
     error: null
 };
 
+// Hàm trích xuất và lưu cookies từ response
 function parseAndSaveCookies(res, jar) {
     let setCookies = [];
     if (typeof res.headers.getSetCookie === 'function') {
@@ -48,10 +51,12 @@ function parseAndSaveCookies(res, jar) {
     }
 }
 
+// Chuyển cookie jar thành chuỗi header
 function stringifyJar(jar) {
     return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
+// Fetch có xử lý redirect thủ công để giữ cookie
 async function safeFetchWithCookies(url, options = {}, jar = {}, timeoutMs = FETCH_TIMEOUT_MS) {
     let targetUrl = url;
     let redirectCount = 0;
@@ -90,10 +95,10 @@ async function safeFetchWithCookies(url, options = {}, jar = {}, timeoutMs = FET
     throw new Error("Quá nhiều lần chuyển hướng");
 }
 
+// Tạo mã QR với cơ chế retry
 async function generateQRWithRetry(cookieJar, imei, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            // BẮT BUỘC: gửi kèm imei trong body
             const qrRes = await safeFetchWithCookies("https://id.zalo.me/account/authen/qr/generate", {
                 method: "POST",
                 headers: {
@@ -102,11 +107,12 @@ async function generateQRWithRetry(cookieJar, imei, maxRetries = 3) {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "Origin": "https://id.zalo.me",
                     "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
-                    "X-Requested-With": "XMLHttpRequest"
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-Zalo-Web-Version": "2.0.0" // Header quan trọng để Zalo chấp nhận
                 },
                 body: new URLSearchParams({
                     continue: "https://chat.zalo.me/",
-                    imei: imei // Tham số quan trọng
+                    imei: imei
                 }).toString()
             }, cookieJar, FETCH_TIMEOUT_MS);
 
@@ -130,7 +136,8 @@ async function runSingleSession() {
     currentSession.id = crypto.randomUUID().slice(0, 8);
     currentSession.status = 'INITIALIZING';
     currentSession.qrData = null;
-    currentSession.imei = crypto.randomUUID(); // Tạo imei duy nhất cho phiên
+    // Tạo IMEI 15 chữ số ngẫu nhiên (chuẩn Zalo Web)
+    currentSession.imei = Math.floor(Math.random() * 9e14 + 1e14).toString();
     currentSession.cookies = null;
     currentSession.error = null;
 
@@ -144,7 +151,7 @@ async function runSingleSession() {
             "has_actived": "1"
         };
 
-        // 1. Khởi tạo phiên Zalo (có thể bỏ qua nếu lỗi)
+        // 1. Khởi tạo phiên Zalo
         try {
             await safeFetchWithCookies("https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F", {
                 method: "GET",
@@ -157,17 +164,20 @@ async function runSingleSession() {
             console.warn(`[Phiên: ${currentSession.id}] Khởi tạo phiên thất bại (bỏ qua):`, e.message);
         }
 
-        // 2. Tạo mã QR với retry (truyền imei vào)
+        // 2. Tạo mã QR (truyền IMEI vào)
         const qrData = await generateQRWithRetry(cookieJar, currentSession.imei);
 
-        // ƯU TIÊN trường code (chuỗi thực sự dùng để tạo QR), sau đó mới đến image/url
-        const qrContent = qrData.code || qrData.qr_code || qrData.url || qrData.image;
-        currentSession.qrData = qrContent;
+        // Lấy code từ response (code là chuỗi dùng để tạo QR)
+        const qrCode = qrData.code || qrData.qr_code;
+        if (!qrCode) {
+            throw new Error("Không nhận được mã code từ Zalo");
+        }
+        
+        currentSession.qrData = qrCode;
         currentSession.status = 'WAITING';
         console.log(`[Phiên: ${currentSession.id}] ✅ Đã tạo mã QR thành công! Chờ quét...`);
-        console.log(`[Phiên: ${currentSession.id}] Nội dung QR: ${qrContent}`);
 
-        // 3. Vòng lặp chờ quét, bỏ qua mọi lỗi timeout
+        // 3. Vòng lặp chờ quét
         const startTime = Date.now();
         let isDone = false;
 
@@ -175,7 +185,6 @@ async function runSingleSession() {
             await new Promise(r => setTimeout(r, 2000));
 
             try {
-                // BẮT BUỘC: gửi kèm imei trong body
                 const checkRes = await safeFetchWithCookies("https://id.zalo.me/account/authen/qr/waiting-scan", {
                     method: "POST",
                     headers: {
@@ -184,18 +193,20 @@ async function runSingleSession() {
                         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                         "Origin": "https://id.zalo.me",
                         "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
-                        "X-Requested-With": "XMLHttpRequest"
+                        "X-Requested-With": "XMLHttpRequest",
+                        "X-Zalo-Web-Version": "2.0.0"
                     },
                     body: new URLSearchParams({
-                        code: qrData.code, // Dùng code từ bước generate
+                        code: qrCode,
                         continue: "https://chat.zalo.me/",
-                        imei: currentSession.imei // Tham số quan trọng
+                        imei: currentSession.imei
                     }).toString()
                 }, cookieJar, 10000);
 
                 const checkJson = await checkRes.json();
                 console.log(`[Waiting Scan]`, JSON.stringify(checkJson, null, 2));
 
+                // status === 2 hoặc có url là đã xác nhận thành công
                 if (checkJson.error_code === 0 && checkJson.data && (checkJson.data.status === 2 || checkJson.data.url)) {
                     console.log(`🎉 [Phiên: ${currentSession.id}] Đăng nhập thành công!`);
 
@@ -243,34 +254,39 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Zalo QR Login (Apple)</title>
+        <title>MacBook Pro - Yêu cầu đăng nhập</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
             body {
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                background-color: #f0f2f5; display: flex; justify-content: center; align-items: center;
+                background-color: #f5f5f7; display: flex; justify-content: center; align-items: center;
                 min-height: 100vh; padding: 16px;
             }
             .card {
-                background: #fff; width: 100%; max-width: 360px;
-                padding: 30px 20px; border-radius: 16px;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.06); text-align: center;
+                background: #fff; width: 100%; max-width: 380px;
+                padding: 30px 20px; border-radius: 18px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.08); text-align: center;
+                border: 1px solid #e5e5e5;
             }
-            h2 { color: #0068ff; margin-bottom: 6px; font-size: 20px; }
+            .macbook-icon { font-size: 40px; margin-bottom: 10px; }
+            h2 { color: #1d1d1f; margin-bottom: 6px; font-size: 20px; font-weight: 600; }
+            .subtitle { font-size: 13px; color: #86868b; margin-bottom: 20px; }
             .badge {
                 display: inline-block; font-size: 11px; background: #eef5ff;
                 color: #0068ff; padding: 4px 10px; border-radius: 20px;
                 margin-bottom: 15px; font-weight: 600;
             }
-            p.desc { font-size: 13px; color: #666; margin-bottom: 16px; }
+            .warning {
+                background: #fff3cd; color: #856404; padding: 10px; border-radius: 8px;
+                font-size: 12px; margin-bottom: 15px; text-align: left; border: 1px solid #ffeeba;
+            }
             .qr-wrapper {
                 width: 250px; height: 250px; margin: 0 auto 16px;
                 border: 1px solid #e1e4ea; border-radius: 12px;
                 display: flex; align-items: center; justify-content: center;
                 background: #fafafa; position: relative; overflow: hidden;
             }
-            .qr-wrapper img { max-width: 100%; max-height: 100%; }
             .spinner {
                 border: 3px solid #f3f3f3; border-top: 3px solid #0068ff;
                 border-radius: 50%; width: 34px; height: 34px;
@@ -284,16 +300,31 @@ app.get('/', (req, res) => {
                 margin-top: 15px; font-size: 12px;
             }
             .result-box textarea {
-                width: 100%; height: 80px; margin-top: 6px; font-family: monospace;
+                width: 100%; height: 70px; margin-top: 6px; font-family: monospace;
                 font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; resize: none;
             }
+            .copy-btn {
+                background: #0068ff; color: #fff; border: none; padding: 6px 12px;
+                border-radius: 6px; font-size: 11px; cursor: pointer; margin-top: 4px;
+            }
+            .info-row { margin-bottom: 8px; }
+            .info-label { font-weight: 600; color: #555; }
+            details { margin-top: 8px; }
+            summary { cursor: pointer; color: #0068ff; font-weight: 600; }
         </style>
     </head>
     <body>
         <div class="card">
-            <h2>Zalo QR Login</h2>
-            <div class="badge">🍎 Thiết bị: Apple macOS (Safari)</div>
-            <p class="desc">Mở Zalo trên điện thoại để quét mã</p>
+            <div class="macbook-icon">💻</div>
+            <h2>MacBook Pro</h2>
+            <div class="subtitle">macOS 14.5 • Safari 17.5</div>
+            <div class="badge">Yêu cầu đăng nhập Zalo</div>
+            
+            <div class="warning">
+                ⚠️ <b>LƯU Ý QUAN TRỌNG:</b><br>
+                KHÔNG sử dụng chức năng <b>"Mã QR của tôi"</b> để quét.<br>
+                Hãy mở Zalo → chọn <b>"Đăng nhập bằng mã QR"</b> (hoặc dùng camera hệ thống quét).
+            </div>
 
             <div class="qr-wrapper" id="qrContainer">
                 <div class="spinner" id="spinner"></div>
@@ -303,8 +334,18 @@ app.get('/', (req, res) => {
             <div class="status-text" id="statusText">Đang tạo mã QR...</div>
 
             <div class="result-box" id="resultBox">
-                <b>Trạng thái:</b> Đã xác nhận đăng nhập thành công!<br>
-                <textarea id="resCookies" readonly></textarea>
+                <div class="info-row">
+                    <span class="info-label">Trạng thái:</span> <span style="color:#28a745;font-weight:bold;">✅ Đăng nhập thành công!</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">IMEI:</span> <span id="imeiDisplay"></span>
+                </div>
+                
+                <details>
+                    <summary>🍪 Xem Cookies (đã thu gọn)</summary>
+                    <textarea id="resCookies" readonly></textarea>
+                    <button class="copy-btn" onclick="copyCookies()">Sao chép Cookies</button>
+                </details>
             </div>
         </div>
 
@@ -332,16 +373,12 @@ app.get('/', (req, res) => {
                             const qrContainer = document.getElementById('qrcode');
                             qrContainer.innerHTML = '';
 
-                            // Xử lý hiển thị QR: nếu là ảnh base64 thì hiển thị, ngược lại tạo QR từ chuỗi
-                            if (data.qrData.startsWith('data:image')) {
-                                qrContainer.innerHTML = '<img src="' + data.qrData + '" style="width:230px;height:230px;" />';
-                            } else {
-                                new QRCode(qrContainer, {
-                                    text: data.qrData,
-                                    width: 230,
-                                    height: 230
-                                });
-                            }
+                            new QRCode(qrContainer, {
+                                text: data.qrData,
+                                width: 230,
+                                height: 230
+                            });
+
                             document.getElementById('statusText').innerText = 'Quét mã và bấm Xác nhận trên điện thoại';
                             document.getElementById('statusText').style.color = '#0068ff';
                         }
@@ -349,11 +386,17 @@ app.get('/', (req, res) => {
                     else if (data.status === 'SUCCESS') {
                         stopped = true;
                         document.getElementById('spinner').style.display = 'none';
-                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;">✔ Đã nhận diện!<br>Mã này đã bị hủy.</p>';
+                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;font-size:16px;">✔ Đã xác nhận!<br>Mã QR đã bị hủy.</p>';
                         document.getElementById('statusText').innerText = '🎉 Đăng nhập thành công!';
                         document.getElementById('statusText').style.color = '#28a745';
                         document.getElementById('resultBox').style.display = 'block';
-                        document.getElementById('resCookies').value = JSON.stringify(data.cookies);
+                        
+                        // Hiển thị IMEI
+                        document.getElementById('imeiDisplay').innerText = data.imei;
+                        
+                        // Hiển thị Cookies dạng chuỗi key=value
+                        const cookieStr = Object.entries(data.cookies).map(([k, v]) => k + '=' + v).join('; ');
+                        document.getElementById('resCookies').value = cookieStr;
                     }
                     else if (data.status === 'ERROR') {
                         document.getElementById('spinner').style.display = 'none';
@@ -365,6 +408,13 @@ app.get('/', (req, res) => {
                     }
                 } catch (e) {}
                 if (!stopped) setTimeout(pollStatus, 1200);
+            }
+
+            function copyCookies() {
+                const textarea = document.getElementById('resCookies');
+                textarea.select();
+                document.execCommand('copy');
+                alert('Đã sao chép Cookies!');
             }
 
             pollStatus();
