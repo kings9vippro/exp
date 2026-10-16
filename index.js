@@ -1,3 +1,10 @@
+// =====================================================================
+// ZALO QR LOGIN - TỰ ĐỘNG ĐĂNG NHẬP VÀO TÀI KHOẢN CỦA BẠN KHI QUÉT MÃ
+// Khi bạn quét mã QR bằng ứng dụng Zalo trên điện thoại và bấm xác nhận,
+// server (thiết bị giả lập Apple macOS Safari) sẽ nhận được cookies đăng nhập
+// và trở thành phiên đăng nhập chính chủ của tài khoản Zalo của bạn.
+// =====================================================================
+
 const express = require('express');
 const crypto = require('crypto');
 
