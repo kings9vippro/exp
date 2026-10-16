@@ -1,181 +1,175 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
+const { chromium } = require('playwright');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Giả lập Safari / macOS để Zalo nhận diện thiết bị Apple
-const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
+const DATA_DIR = path.join(__dirname, 'sessions');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let currentSession = {
     id: null,
     status: 'INITIALIZING', // INITIALIZING | WAITING | SUCCESS | ERROR
-    qrData: null,
+    qrPath: null,
     imei: null,
     cookies: null,
     error: null
 };
 
-// Hàm trích xuất toàn bộ cookie từ phản hồi của Zalo
-function collectCookies(response, cookieJar) {
-    let setCookies = [];
-    if (typeof response.headers.getSetCookie === 'function') {
-        setCookies = response.headers.getSetCookie();
-    } else {
-        const raw = response.headers.get('set-cookie');
-        if (raw) setCookies = [raw];
-    }
+const LOGGED_DEVICES = [];
 
-    for (const cookieStr of setCookies) {
-        const firstPart = cookieStr.split(';')[0];
-        const eqIdx = firstPart.indexOf('=');
-        if (eqIdx !== -1) {
-            const key = firstPart.substring(0, eqIdx).trim();
-            const val = firstPart.substring(eqIdx + 1).trim();
-            if (key) cookieJar[key] = val;
-        }
-    }
-}
+// Cấu hình định danh thiết bị iPhone 18 Pro Max chính xác
+const iPhone18ProMaxDevice = {
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    viewport: { width: 430, height: 932 },
+    deviceScaleFactor: 3,
+    isMobile: true,
+    hasTouch: true
+};
 
-function stringifyCookies(cookieJar) {
-    return Object.entries(cookieJar).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-// Vòng lặp tự động tạo QR một lần và làm mới liên tục
-async function startSessionLoop() {
+async function runZaloSessionLoop() {
     while (true) {
-        currentSession.id = crypto.randomUUID().slice(0, 8);
+        const sessionId = crypto.randomUUID().slice(0, 8);
+        const qrFileName = `qr_${sessionId}.png`;
+        const qrFilePath = path.join(DATA_DIR, qrFileName);
+
+        currentSession.id = sessionId;
         currentSession.status = 'INITIALIZING';
-        currentSession.qrData = null;
+        currentSession.qrPath = `/qr-image/${sessionId}`;
         currentSession.imei = crypto.randomUUID();
         currentSession.cookies = null;
         currentSession.error = null;
 
-        console.log(`\n========================================`);
-        console.log(`[Phiên mới: ${currentSession.id}] Đang yêu cầu Zalo cấp mã QR...`);
+        let browser = null;
 
         try {
-            let cookieJar = {};
+            console.log(`\n========================================`);
+            console.log(`[iPhone 18 Pro Max - Phiên: ${sessionId}] Khởi tạo phiên trình duyệt di động...`);
 
-            // 1. Tải trang xác thực ban đầu để lấy cookie phiên (Session Cookies)
-            const initRes = await fetch("https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F", {
-                headers: {
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8"
+            browser = await chromium.launch({
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--single-process'
+                ]
+            });
+
+            const context = await browser.newContext(iPhone18ProMaxDevice);
+            const page = await context.new_page();
+
+            console.log(`[Phiên: ${sessionId}] Đang kết nối Zalo Web...`);
+            await page.goto('https://chat.zalo.me/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.waitForTimeout(4000);
+
+            // Chuyển sang tab mã QR nếu giao diện yêu cầu
+            try {
+                const qrTab = await page.locator('text=/QR|Quét mã/i').first();
+                if (await qrTab.isVisible()) {
+                    await qrTab.click();
+                    await page.waitForTimeout(2000);
                 }
-            });
-            collectCookies(initRes, cookieJar);
+            } catch (e) {}
 
-            // 2. Gửi request POST đúng chuẩn để sinh mã QR
-            const qrRes = await fetch("https://id.zalo.me/account/authen/qr/generate", {
-                method: "POST",
-                headers: {
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin": "https://id.zalo.me",
-                    "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                    "Cookie": stringifyCookies(cookieJar)
-                },
-                body: new URLSearchParams({
-                    continue: "https://chat.zalo.me/"
-                }).toString()
-            });
-
-            collectCookies(qrRes, cookieJar);
-
-            const qrJson = await qrRes.json();
-            if (qrJson.error_code !== 0 || !qrJson.data) {
-                throw new Error(qrJson.error_message || "Zalo từ chối cấp mã QR");
-            }
-
-            const code = qrJson.data.code;
-            currentSession.qrData = qrJson.data.image || qrJson.data.url || code;
+            // Chụp lại màn hình mã QR
+            await page.screenshot({ path: qrFilePath, fullPage: false });
             currentSession.status = 'WAITING';
-            console.log(`[Phiên: ${currentSession.id}] ✅ Đã tạo mã QR thành công! Chờ quét...`);
+            console.log(`[Phiên: ${sessionId}] ✅ Đã tạo mã QR iPhone 18 Pro Max thành công! Đang đợi quét...`);
 
-            // 3. Vòng lặp chờ xác nhận quét từ điện thoại
+            // Vòng lặp chờ quét từ điện thoại (Thời hạn tối đa 2 phút)
             const startTime = Date.now();
-            let isDone = false;
+            let success = false;
 
-            while (Date.now() - startTime < 120000) { // Hạn mã: 2 phút
-                await new Promise(r => setTimeout(r, 2000));
+            while (Date.now() - startTime < 120000) {
+                await page.waitForTimeout(1500);
 
-                const checkRes = await fetch("https://id.zalo.me/account/authen/qr/waiting-scan", {
-                    method: "POST",
-                    headers: {
-                        "User-Agent": USER_AGENT,
-                        "Accept": "application/json, text/javascript, */*; q=0.01",
-                        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Origin": "https://id.zalo.me",
-                        "Referer": "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Cookie": stringifyCookies(cookieJar)
-                    },
-                    body: new URLSearchParams({
-                        code: code,
-                        continue: "https://chat.zalo.me/"
-                    }).toString()
-                });
+                const cookies = await context.cookies();
+                const ckMap = {};
+                cookies.forEach(c => { ckMap[c.name] = c.value; });
 
-                collectCookies(checkRes, cookieJar);
+                const currentUrl = page.url();
 
-                const checkJson = await checkRes.json();
+                // Nhận diện trạng thái đã bấm xác nhận trên điện thoại
+                if (ckMap['zpw_sek'] || (currentUrl.includes('chat.zalo.me') && !currentUrl.includes('login'))) {
+                    console.log(`🎉 [Phiên: ${sessionId}] Đã quét thành công dưới danh nghĩa iPhone 18 Pro Max!`);
+                    await page.waitForTimeout(2000);
 
-                // Trạng thái đã duyệt trên ứng dụng Zalo
-                if (checkJson.error_code === 0 && checkJson.data && (checkJson.data.status === 2 || checkJson.data.url)) {
-                    console.log(`🎉 [Phiên: ${currentSession.id}] Đăng nhập thành công từ thiết bị Apple!`);
-
-                    if (checkJson.data.url) {
-                        const finalRes = await fetch(checkJson.data.url, {
-                            headers: {
-                                "User-Agent": USER_AGENT,
-                                "Cookie": stringifyCookies(cookieJar)
-                            },
-                            redirect: 'manual'
-                        });
-                        collectCookies(finalRes, cookieJar);
-                    }
+                    const finalCookies = await context.cookies();
+                    const finalCkMap = {};
+                    finalCookies.forEach(c => { finalCkMap[c.name] = c.value; });
 
                     currentSession.status = 'SUCCESS';
-                    currentSession.cookies = cookieJar;
-                    currentSession.qrData = null; // Tiêu hủy QR ngay lập tức
-                    isDone = true;
+                    currentSession.cookies = finalCkMap;
+                    success = true;
 
-                    // Dừng 3.5 giây để màn hình báo thành công trước khi đổi sang QR mới
-                    await new Promise(r => setTimeout(r, 3500));
+                    LOGGED_DEVICES.push({
+                        sessionId,
+                        device: 'iPhone 18 Pro Max (iOS 18)',
+                        time: new Date().toLocaleTimeString(),
+                        cookies: finalCkMap
+                    });
+
+                    // Tiêu hủy file QR ngay lập tức (Cơ chế dùng 1 lần)
+                    if (fs.existsSync(qrFilePath)) {
+                        fs.unlinkSync(qrFilePath);
+                    }
+
+                    // Giữ thông báo thành công trong 4 giây trước khi tự động chuyển sang mã mới
+                    await new Promise(r => setTimeout(r, 4000));
                     break;
                 }
             }
 
-            if (!isDone) {
-                console.log(`[Phiên: ${currentSession.id}] Mã QR hết hạn, đang tạo mã mới...`);
+            if (!success) {
+                console.log(`[Phiên: ${sessionId}] Hết thời gian chờ QR, đang tự làm mới...`);
+                if (fs.existsSync(qrFilePath)) fs.unlinkSync(qrFilePath);
             }
 
         } catch (err) {
-            console.error(`❌ [Phiên: ${currentSession.id}] Lỗi:`, err.message);
+            console.error(`❌ [Phiên: ${sessionId}] Lỗi hệ thống:`, err.message);
             currentSession.status = 'ERROR';
             currentSession.error = err.message;
+            if (fs.existsSync(qrFilePath)) fs.unlinkSync(qrFilePath);
             await new Promise(r => setTimeout(r, 3000));
+        } finally {
+            if (browser) {
+                await browser.close().catch(() => {});
+            }
         }
     }
 }
 
-startSessionLoop();
+// Chạy vòng lặp tiến trình ngầm
+runZaloSessionLoop();
 
-// API cung cấp dữ liệu phiên cho giao diện
-app.get('/api/status', (req, res) => {
-    res.json(currentSession);
+// Cung cấp file ảnh QR
+app.get('/qr-image/:sessionId', (req, res) => {
+    const filePath = path.join(DATA_DIR, `qr_${req.params.sessionId}.png`);
+    if (fs.existsSync(filePath)) {
+        res.setHeader('Cache-Control', 'no-store');
+        return res.sendFile(filePath);
+    }
+    res.status(404).send('Mã QR đã dùng hoặc không tồn tại.');
 });
 
-// Giao diện người dùng
+// API trả về trạng thái giao diện
+app.get('/api/status', (req, res) => {
+    res.json({
+        id: currentSession.id,
+        status: currentSession.status,
+        qrUrl: currentSession.qrPath,
+        cookies: currentSession.cookies,
+        error: currentSession.error,
+        totalLogged: LOGGED_DEVICES.length
+    });
+});
+
+// Giao diện web tối ưu trực quan
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -183,8 +177,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Zalo QR Login (Apple)</title>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+        <title>Zalo Login — iPhone 18 Pro Max</title>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
             body {
@@ -193,57 +186,57 @@ app.get('/', (req, res) => {
                 min-height: 100vh; padding: 16px;
             }
             .card {
-                background: #fff; width: 100%; max-width: 360px;
-                padding: 30px 20px; border-radius: 16px;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.06); text-align: center;
+                background: #fff; width: 100%; max-width: 380px;
+                padding: 32px 20px; border-radius: 20px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.08); text-align: center;
             }
-            h2 { color: #0068ff; margin-bottom: 6px; font-size: 20px; }
+            h2 { color: #0068ff; margin-bottom: 6px; font-size: 22px; font-weight: 800; }
             .badge {
-                display: inline-block; font-size: 11px; background: #eef5ff;
-                color: #0068ff; padding: 4px 10px; border-radius: 20px;
-                margin-bottom: 15px; font-weight: 600;
+                display: inline-block; font-size: 12px; background: #eef5ff;
+                color: #0068ff; padding: 6px 14px; border-radius: 20px;
+                margin-bottom: 16px; font-weight: 700;
             }
-            p.desc { font-size: 13px; color: #666; margin-bottom: 16px; }
+            p.desc { font-size: 13px; color: #666; margin-bottom: 18px; }
             .qr-wrapper {
                 width: 250px; height: 250px; margin: 0 auto 16px;
-                border: 1px solid #e1e4ea; border-radius: 12px;
+                border: 2px solid #e1e4ea; border-radius: 16px;
                 display: flex; align-items: center; justify-content: center;
                 background: #fafafa; position: relative; overflow: hidden;
             }
-            .qr-wrapper img { max-width: 100%; max-height: 100%; }
+            .qr-wrapper img { width: 100%; height: 100%; object-fit: contain; }
             .spinner {
                 border: 3px solid #f3f3f3; border-top: 3px solid #0068ff;
-                border-radius: 50%; width: 34px; height: 34px;
+                border-radius: 50%; width: 40px; height: 40px;
                 animation: spin 0.8s linear infinite;
             }
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-            .status-text { font-size: 14px; font-weight: 500; color: #444; min-height: 24px; }
+            .status-text { font-size: 14px; font-weight: 600; color: #444; min-height: 28px; }
             .result-box {
                 display: none; text-align: left; background: #f8f9fa;
-                border: 1px solid #e9ecef; padding: 12px; border-radius: 8px;
-                margin-top: 15px; font-size: 12px;
+                border: 1px solid #e9ecef; padding: 14px; border-radius: 12px;
+                margin-top: 18px; font-size: 12px;
             }
             .result-box textarea {
-                width: 100%; height: 80px; margin-top: 6px; font-family: monospace;
-                font-size: 11px; padding: 6px; border: 1px solid #ccc; border-radius: 4px; resize: none;
+                width: 100%; height: 90px; margin-top: 6px; font-family: monospace;
+                font-size: 11px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; resize: none;
             }
         </style>
     </head>
     <body>
         <div class="card">
             <h2>Zalo QR Login</h2>
-            <div class="badge">Thiết bị: Apple Safari (macOS / iPad)</div>
-            <p class="desc">Mở Zalo trên điện thoại để quét mã</p>
+            <div class="badge">📱 Thiết bị: iPhone 18 Pro Max (iOS 18)</div>
+            <p class="desc">Mở Zalo trên điện thoại để quét mã định danh</p>
 
             <div class="qr-wrapper" id="qrContainer">
                 <div class="spinner" id="spinner"></div>
-                <div id="qrcode"></div>
+                <img id="qrImg" style="display: none;" alt="QR Code">
             </div>
 
-            <div class="status-text" id="statusText">Đang khởi tạo mã QR...</div>
+            <div class="status-text" id="statusText">Đang khởi tạo thiết bị Apple...</div>
 
             <div class="result-box" id="resultBox">
-                <b>Trạng thái:</b> Đã xác nhận đăng nhập thành công!<br>
+                <b>✅ Đăng nhập thành công!</b><br>
                 <textarea id="resCookies" readonly></textarea>
             </div>
         </div>
@@ -258,42 +251,33 @@ app.get('/', (req, res) => {
 
                     if (data.status === 'INITIALIZING') {
                         document.getElementById('spinner').style.display = 'block';
-                        document.getElementById('qrcode').innerHTML = '';
-                        document.getElementById('statusText').innerText = 'Đang yêu cầu mã từ Zalo...';
+                        document.getElementById('qrImg').style.display = 'none';
+                        document.getElementById('statusText').innerText = 'Đang khởi tạo iPhone 18 Pro Max...';
                         document.getElementById('statusText').style.color = '#555';
                         document.getElementById('resultBox').style.display = 'none';
                     } 
-                    else if (data.status === 'WAITING' && data.qrData) {
+                    else if (data.status === 'WAITING' && data.qrUrl) {
                         if (lastSid !== data.id) {
                             lastSid = data.id;
                             document.getElementById('spinner').style.display = 'none';
-                            const qrContainer = document.getElementById('qrcode');
-                            qrContainer.innerHTML = '';
-
-                            if (data.qrData.startsWith('data:image')) {
-                                qrContainer.innerHTML = '<img src="' + data.qrData + '" style="width:230px;height:230px;" />';
-                            } else {
-                                new QRCode(qrContainer, {
-                                    text: data.qrData,
-                                    width: 230,
-                                    height: 230
-                                });
-                            }
-                            document.getElementById('statusText').innerText = 'Quét mã và bấm Xác nhận trên điện thoại';
+                            const img = document.getElementById('qrImg');
+                            img.src = data.qrUrl + '?t=' + Date.now();
+                            img.style.display = 'block';
+                            document.getElementById('statusText').innerText = 'Mở Zalo quét mã và bấm Xác nhận';
                             document.getElementById('statusText').style.color = '#0068ff';
                         }
                     } 
                     else if (data.status === 'SUCCESS') {
                         document.getElementById('spinner').style.display = 'none';
-                        document.getElementById('qrcode').innerHTML = '<p style="color:#28a745;font-weight:bold;">✔ Đã nhận diện!<br>Mã này đã bị hủy.</p>';
-                        document.getElementById('statusText').innerText = '🎉 Đăng nhập thành công! Đang đổi mã mới...';
+                        document.getElementById('qrImg').style.display = 'none';
+                        document.getElementById('statusText').innerText = '🎉 Đăng nhập iPhone 18 Pro Max thành công! Đang đổi mã mới...';
                         document.getElementById('statusText').style.color = '#28a745';
                         document.getElementById('resultBox').style.display = 'block';
-                        document.getElementById('resCookies').value = JSON.stringify(data.cookies);
+                        document.getElementById('resCookies').value = JSON.stringify(data.cookies, null, 2);
                     }
                     else if (data.status === 'ERROR') {
                         document.getElementById('spinner').style.display = 'none';
-                        document.getElementById('statusText').innerText = data.error || 'Lỗi kết nối Zalo, đang thử lại...';
+                        document.getElementById('statusText').innerText = 'Lỗi kết nối, đang thử lại...';
                         document.getElementById('statusText').style.color = '#dc3545';
                     }
                 } catch (e) {}
@@ -305,5 +289,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Server khởi động thành công trên cổng: ${PORT}`);
+    console.log(`Server chạy tại cổng: ${PORT}`);
 });
